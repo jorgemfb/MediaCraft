@@ -1,0 +1,45 @@
+
+# Binarios y ejecutables
+mediacraft.exe
+mediacraft
+*.exe
+*.test
+*.out
+
+# Archivos multimedia
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+*.mp3
+*.aac
+*.wav
+*.flac
+*.ogg
+*.part
+
+# Archivos temporales y logs
+*.tmp
+*.log
+*.bak
+ffmpeg2pass-0.log
+ffmpeg2pass-1.log
+
+# Archivos comprimidos y backups
+*.tar.gz
+*.zip
+*.7z
+*.rar
+Backup/
+
+# Archivos de entorno
+.env
+*.env
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db
+
+# Archivos de VSCode
+.vscode/
