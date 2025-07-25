@@ -16,7 +16,7 @@ var (
 	helpFlag    = flag.Bool("h", false, "Mostrar ayuda")
 )
 
-const version = "v0.1.0"
+const version = "v0.2.0"
 const projectName = "Nostromo"
 const author = "JorgeMFB"
 const releaseDate = "24 de julio de 2025"

@@ -3,26 +3,136 @@ package encode
 import (
 	"fmt"
 	"mediacraft/decompress"
+	"net/http"
+	"net/url"
+	"os"
 	"os/exec"
+	"os/user"
+	"path"
+	"path/filepath"
+	"strings"
 	"time"
+
+	"gopkg.in/ini.v1"
 )
 
-// Perfiles de conversión
-var profiles = map[string][]string{
-	"telegram": {"-hwaccel", "cuda", "-c:v", "h264_nvenc", "-preset", "slow", "-c:a", "aac"},
-	"plex":     {"-hwaccel", "cuda", "-c:v", "hevc_nvenc", "-b:v", "5000k", "-preset", "slow", "-c:a", "aac", "-b:a", "320k"},
-	"alta":     {"-hwaccel", "cuda", "-c:v", "hevc_nvenc", "-preset", "slow", "-crf", "18", "-c:a", "aac", "-b:a", "256k"},
-	"media":    {"-hwaccel", "cuda", "-c:v", "hevc_nvenc", "-preset", "medium", "-crf", "23", "-c:a", "aac", "-b:a", "160k"},
-	"baja":     {"-hwaccel", "cuda", "-c:v", "hevc_nvenc", "-preset", "veryfast", "-crf", "32", "-c:a", "aac", "-b:a", "96k"},
-	"movil":    {"-hwaccel", "cuda", "-c:v", "h264_nvenc", "-preset", "ultrafast", "-crf", "35", "-c:a", "aac", "-b:a", "64k", "-vf", "scale=640:-2"},
-	"youtube":  {"-hwaccel", "cuda", "-c:v", "h264_nvenc", "-preset", "medium", "-crf", "20", "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p"},
-	"av1":      {"-c:v", "libaom-av1", "-crf", "30", "-b:v", "0", "-c:a", "libopus", "-b:a", "128k"},
+// Variables globales de configuración y perfiles
+var (
+	profiles            map[string][]string
+	profileExts         map[string]string
+	defaultProfile      string
+	outputDir           string
+	enableNotifications bool
+	telegramToken       string
+	telegramChatID      string
+)
+
+// Carga perfiles y configuración desde el archivo INI
+func loadProfiles() error {
+	var confPath string
+	if os.PathSeparator == '\\' { // Windows
+		userProfile := os.Getenv("USERPROFILE")
+		confPath = path.Join(userProfile, ".config", "mediacraft", "mediacraft.conf")
+	} else { // Unix-like
+		usr, err := user.Current()
+		if err != nil {
+			return err
+		}
+		confPath = path.Join(usr.HomeDir, ".config", "mediacraft", "mediacraft.conf")
+	}
+	if _, err := os.Stat(confPath); err != nil {
+		return fmt.Errorf("no se encontró el archivo de configuración: %s", confPath)
+	}
+	cfg, err := ini.Load(confPath)
+	if err != nil {
+		return err
+	}
+	profiles = map[string][]string{}
+	profileExts = map[string]string{}
+	defaultProfile = "telegram"
+	outputDir = ""
+	enableNotifications = false
+	telegramToken = ""
+	telegramChatID = ""
+	// Leer configuración general
+	if sec, err := cfg.GetSection("mediacraft"); err == nil {
+		if sec.HasKey("default_profile") {
+			defaultProfile = sec.Key("default_profile").String()
+		}
+		if sec.HasKey("output_dir") {
+			outputDir = sec.Key("output_dir").String()
+		}
+		if sec.HasKey("notificaciones") {
+			v := sec.Key("notificaciones").String()
+			if v == "1" || v == "true" || v == "TRUE" || v == "True" {
+				enableNotifications = true
+			}
+		}
+	}
+	// Leer configuración de Telegram
+	if sec, err := cfg.GetSection("telegram"); err == nil {
+		if sec.HasKey("token") {
+			telegramToken = sec.Key("token").String()
+		}
+		if sec.HasKey("chat_id") {
+			telegramChatID = sec.Key("chat_id").String()
+		}
+	}
+	for _, section := range cfg.Sections() {
+		name := section.Name()
+		if len(name) > 9 && name[:9] == "perfiles." {
+			profileName := name[9:]
+			args := []string{}
+			var videoCodec, audioCodec, kvideo, kaudio string
+			for _, key := range section.KeyStrings() {
+				v := section.Key(key).String()
+				if v == "" {
+					continue
+				}
+				k := strings.ToLower(strings.TrimSpace(key))
+				switch k {
+				case "ext":
+					profileExts[profileName] = v
+				case "video":
+					videoCodec = strings.TrimSpace(v)
+				case "audio":
+					audioCodec = strings.TrimSpace(v)
+				case "kvideo":
+					kvideo = strings.TrimSpace(v)
+				case "kaudio":
+					kaudio = strings.TrimSpace(v)
+				default:
+					vNorm := strings.TrimSpace(strings.ReplaceAll(v, "=", ""))
+					args = append(args, "-"+k, vNorm)
+				}
+			}
+			if videoCodec != "" {
+				args = append(args, "-c:v", videoCodec)
+			}
+			if kvideo != "" {
+				args = append(args, "-b:v", kvideo)
+			}
+			if audioCodec != "" {
+				args = append(args, "-c:a", audioCodec)
+			}
+			if kaudio != "" {
+				args = append(args, "-b:a", kaudio)
+			}
+			profiles[profileName] = args
+		}
+	}
+	return nil
 }
 
 // Convert recibe el path y un perfil (por defecto: telegram)
 func Convert(path string) {
+	// Cargar perfiles desde el archivo INI
+	if err := loadProfiles(); err != nil {
+		fmt.Println("[ERROR] No se pudieron cargar los perfiles:", err)
+		return
+	}
 	// Determinar perfil y archivo real (soporta nombres con espacios)
-	profile := "telegram"
+	profile := defaultProfile
 	realPath := path
 	at := lastAt(path)
 	if at != -1 && at != 0 && at != len(path)-1 {
@@ -45,19 +155,60 @@ func Convert(path string) {
 		inputName = finalPath
 	}
 
-	// Determinar extensión de salida según perfil
+	// Determinar extensión de salida y formato ffmpeg (-f)
 	var outExt string
-	switch profile {
-	case "plex", "alta", "media", "baja":
-		outExt = ".mkv"
-	case "movil", "youtube":
-		outExt = ".mp4"
-	case "av1":
-		outExt = ".webm"
-	default:
-		outExt = ".mp4"
+	var ffFormat string
+	if ext, ok := profileExts[profile]; ok {
+		outExt = ext
+		if len(outExt) > 0 && outExt[0] != '.' {
+			outExt = "." + outExt
+		}
+		// Normalizar ffFormat según la extensión
+		switch strings.ToLower(outExt) {
+		case ".mkv":
+			ffFormat = "matroska"
+		case ".mp4":
+			ffFormat = "mp4"
+		case ".webm":
+			ffFormat = "webm"
+		default:
+			ffFormat = strings.TrimPrefix(strings.ToLower(outExt), ".")
+		}
+	} else {
+		switch profile {
+		case "plex", "alta", "media", "baja":
+			outExt = ".mkv"
+			ffFormat = "matroska"
+		case "movil", "youtube":
+			outExt = ".mp4"
+			ffFormat = "mp4"
+		case "av1":
+			outExt = ".webm"
+			ffFormat = "webm"
+		default:
+			outExt = ".mp4"
+			ffFormat = "mp4"
+		}
 	}
-	out := getOutputNameWithExt(realPath, outExt)
+	// Determinar ruta de salida
+	outName := getOutputNameWithExt(realPath, outExt)
+	out := outName
+	if outputDir != "" {
+		// Convertir outputDir a ruta absoluta si es relativa
+		absOutputDir := outputDir
+		if !filepath.IsAbs(outputDir) {
+			cwd, _ := os.Getwd()
+			absOutputDir = filepath.Join(cwd, outputDir)
+		}
+		if _, err := os.Stat(absOutputDir); os.IsNotExist(err) {
+			err = os.MkdirAll(absOutputDir, 0755)
+			if err != nil {
+			}
+		} else {
+		}
+		out = filepath.Join(absOutputDir, fileNameWithExt(outName))
+	}
+	fmt.Printf("Archivo de salida final: %s\n", out)
 
 	// Mensajes previos profesionales (después de determinar perfil y extensión)
 	fmt.Printf("\n [SELECCIONADO] Perfil %s\n", capitalize(profile))
@@ -73,6 +224,8 @@ func Convert(path string) {
 	spinner := []rune{'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'}
 	totalDuration := getDuration(inputName)
 	totalStr := formatDuration(totalDuration)
+	// --- Ejecutar ffmpeg según perfil ---
+	var argsLog1, argsLog2 []string
 	go func() {
 		i := 0
 		current := "00:00:00"
@@ -93,6 +246,7 @@ func Convert(path string) {
 			}
 		}
 	}()
+
 	switch profile {
 	case "telegram":
 		duration := getDuration(inputName)
@@ -105,62 +259,126 @@ func Convert(path string) {
 				videoBitrate = 1000
 			}
 		}
-		args := []string{"-hwaccel", "cuda", "-i", inputName, "-c:v", "h264_nvenc", "-b:v", fmt.Sprintf("%dk", int(videoBitrate)), "-preset", "slow", "-c:a", "aac", "-b:a", "128k", out}
-		runFfmpegWithProgress(args, progressChan)
+		argsLog1 = []string{"-hwaccel", "cuda", "-i", inputName, "-c:v", "h264_nvenc", "-b:v", fmt.Sprintf("%dk", int(videoBitrate)), "-preset", "slow", "-c:a", "aac", "-b:a", "128k"}
+		if ffFormat != "" && out != "" {
+			argsLog1 = append(argsLog1, "-f", ffFormat)
+		}
+		argsLog1 = append(argsLog1, out)
+		runFfmpegWithProgress(argsLog1, progressChan)
 	case "plex":
-		args1 := []string{"-y", "-hwaccel", "cuda", "-i", inputName, "-c:v", "hevc_nvenc", "-b:v", "5000k", "-preset", "slow", "-pass", "1", "-an", "-f", "null", "NUL"}
-		args2 := []string{"-hwaccel", "cuda", "-i", inputName, "-c:v", "hevc_nvenc", "-b:v", "5000k", "-preset", "slow", "-pass", "2", "-c:a", "aac", "-b:a", "320k", out}
-		runFfmpegWithProgress(args1, progressChan)
-		fmt.Println()
-		runFfmpegWithProgress(args2, progressChan)
-		fmt.Println()
+		argsLog1 = []string{"-y", "-hwaccel", "cuda", "-i", inputName, "-c:v", "hevc_nvenc", "-b:v", "5000k", "-preset", "slow", "-pass", "1", "-an", "-f", "null", "NUL"}
+		argsLog2 = []string{"-hwaccel", "cuda", "-i", inputName, "-c:v", "hevc_nvenc", "-b:v", "5000k", "-preset", "slow", "-pass", "2", "-c:a", "aac", "-b:a", "320k"}
+		if ffFormat != "" && out != "" {
+			argsLog2 = append(argsLog2, "-f", ffFormat)
+		}
+		argsLog2 = append(argsLog2, out)
+		runFfmpegWithProgress(argsLog1, progressChan)
+		runFfmpegWithProgress(argsLog2, progressChan)
 	case "alta", "media", "baja":
-		// Dos pasadas hevc_nvenc
-		args1 := []string{"-y", "-hwaccel", "cuda", "-i", inputName, "-c:v", "hevc_nvenc"}
-		args1 = append(args1, profiles[profile][2:]...)
-		args1 = append(args1, "-pass", "1", "-an", "-f", "null", "NUL")
-		args2 := []string{"-hwaccel", "cuda", "-i", inputName, "-c:v", "hevc_nvenc"}
-		args2 = append(args2, profiles[profile][2:]...)
-		args2 = append(args2, "-pass", "2", out)
-		runFfmpegWithProgress(args1, progressChan)
-		fmt.Println()
-		runFfmpegWithProgress(args2, progressChan)
-		fmt.Println()
+		argsLog1 = []string{"-y", "-hwaccel", "cuda", "-i", inputName}
+		argsLog1 = append(argsLog1, profiles[profile]...)
+		argsLog1 = append(argsLog1, "-pass", "1", "-an", "-f", "null", "NUL")
+		argsLog2 = []string{"-hwaccel", "cuda", "-i", inputName}
+		argsLog2 = append(argsLog2, profiles[profile]...)
+		argsLog2 = append(argsLog2, "-pass", "2")
+		if ffFormat != "" && out != "" {
+			argsLog2 = append(argsLog2, "-f", ffFormat)
+		}
+		argsLog2 = append(argsLog2, out)
+		runFfmpegWithProgress(argsLog1, progressChan)
+		runFfmpegWithProgress(argsLog2, progressChan)
 	case "movil", "youtube":
-		// Una pasada h264_nvenc
-		args := []string{"-hwaccel", "cuda", "-i", inputName, "-c:v", "h264_nvenc"}
-		args = append(args, profiles[profile][2:]...)
-		args = append(args, out)
-		runFfmpegWithProgress(args, progressChan)
+		argsLog1 = []string{"-hwaccel", "cuda", "-i", inputName, "-c:v", "h264_nvenc"}
+		if len(profiles[profile]) > 2 {
+			argsLog1 = append(argsLog1, profiles[profile][2:]...)
+		}
+		if ffFormat != "" && out != "" {
+			argsLog1 = append(argsLog1, "-f", ffFormat)
+		}
+		argsLog1 = append(argsLog1, out)
+		runFfmpegWithProgress(argsLog1, progressChan)
 	case "av1":
-		// Dos pasadas AV1
-		args1 := []string{"-y", "-i", inputName, "-c:v", "libaom-av1", "-crf", "30", "-b:v", "0", "-pass", "1", "-an", "-f", "null", "NUL"}
-		args2 := []string{"-i", inputName, "-c:v", "libaom-av1", "-crf", "30", "-b:v", "0", "-pass", "2", "-c:a", "libopus", "-b:a", "128k", out}
-		runFfmpegWithProgress(args1, progressChan)
-		fmt.Println()
-		runFfmpegWithProgress(args2, progressChan)
-		fmt.Println()
+		argsLog1 = []string{"-y", "-i", inputName, "-c:v", "libaom-av1", "-crf", "30", "-b:v", "0", "-pass", "1", "-an", "-f", "null", "NUL"}
+		argsLog2 = []string{"-i", inputName, "-c:v", "libaom-av1", "-crf", "30", "-b:v", "0", "-pass", "2", "-c:a", "libopus", "-b:a", "128k"}
+		if ffFormat != "" && out != "" {
+			argsLog2 = append(argsLog2, "-f", ffFormat)
+		}
+		argsLog2 = append(argsLog2, out)
+		runFfmpegWithProgress(argsLog1, progressChan)
+		runFfmpegWithProgress(argsLog2, progressChan)
 	default:
-		// Fallback: una pasada
-		args := []string{"-i", inputName}
-		args = append(args, profiles[profile]...)
-		args = append(args, out)
-		runFfmpegWithProgress(args, progressChan)
+		argsLog1 = []string{"-i", inputName}
+		argsLog1 = append(argsLog1, profiles[profile]...)
+		if ffFormat != "" && out != "" {
+			argsLog1 = append(argsLog1, "-f", ffFormat)
+		}
+		argsLog1 = append(argsLog1, out)
+		runFfmpegWithProgress(argsLog1, progressChan)
 	}
 	close(doneChan)
-	fmt.Printf("Resumen: %s → %s | Perfil: %s | Duración: %s | Progreso final: %s\n", fileNameWithExt(inputName), fileNameWithExt(out), profile, formatDuration(getDuration(out)), lastProgress)
+	// Mostrar resumen final limpio
+	info, err := os.Stat(out)
+	var durOut float64
+	if err == nil && info.Size() > 0 {
+		durOut = getDuration(out)
+	} else {
+		durOut = 0
+	}
+	resumen := fmt.Sprintf("Resumen: %s → %s | Perfil: %s | Duración salida: %s | Progreso final: %s", fileNameWithExt(inputName), fileNameWithExt(out), profile, formatDuration(durOut), lastProgress)
+	fmt.Println(resumen)
+	// Notificación Telegram si está habilitado
+	if enableNotifications && telegramToken != "" && telegramChatID != "" {
+		go sendTelegramNotification(telegramToken, telegramChatID, resumen)
+	}
+}
+
+// Envía una notificación a Telegram usando el bot y chat_id configurados
+func sendTelegramNotification(token, chatID, message string) {
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
+	data := url.Values{}
+	data.Set("chat_id", chatID)
+	data.Set("text", message)
+	data.Set("disable_web_page_preview", "true")
+	data.Set("parse_mode", "HTML")
+	_, _ = http.Post(apiURL, "application/x-www-form-urlencoded", strings.NewReader(data.Encode()))
 }
 
 // getOutputNameWithExt genera el nombre de salida limpio con la extensión deseada
+// getOutputNameWithExt genera el nombre de salida limpio con la extensión deseada
 func getOutputNameWithExt(input string, ext string) string {
-	base := input
-	if at := findSubstring(base, "@"); at != -1 {
-		base = base[:at]
+	// Quitar ruta
+	name := input
+	for i := len(name) - 1; i >= 0; i-- {
+		if name[i] == '/' || name[i] == '\\' {
+			name = name[i+1:]
+			break
+		}
 	}
-	if dot := findSubstring(base, "."); dot != -1 {
-		base = base[:dot]
+	// Quitar @perfil si lo hubiera
+	if at := findSubstring(name, "@"); at != -1 {
+		name = name[:at]
 	}
-	return base + ext
+	// Quitar extensión existente
+	if dot := findSubstring(name, "."); dot != -1 {
+		name = name[:dot]
+	}
+	// Si el nombre queda vacío, usar 'output'
+	if len(name) == 0 {
+		name = "output"
+	}
+	outputName := name + ext
+	// Si el nombre de salida coincide con el de entrada (ignorando ruta), agregar sufijo
+	inputBase := input
+	for i := len(inputBase) - 1; i >= 0; i-- {
+		if inputBase[i] == '/' || inputBase[i] == '\\' {
+			inputBase = inputBase[i+1:]
+			break
+		}
+	}
+	if strings.EqualFold(outputName, inputBase) {
+		outputName = name + "_out" + ext
+	}
+	return outputName
 }
 
 // fileNameWithExt devuelve el nombre de archivo con extensión, sin ruta
