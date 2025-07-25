@@ -16,10 +16,10 @@ var (
 	helpFlag    = flag.Bool("h", false, "Mostrar ayuda")
 )
 
-const version = "v0.2.0"
+const version = "v1.0.0"
 const projectName = "Nostromo"
 const author = "JorgeMFB"
-const releaseDate = "24 de julio de 2025"
+const releaseDate = "25 de julio de 2025 (primera versión estable)"
 
 func main() {
 	// Preprocesar flags largos para compatibilidad con el paquete flag
@@ -71,7 +71,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	config.LoadConfig()
+	config.LoadProfiles()
 
 	if *convertFlag != "" {
 		encode.Convert(*convertFlag)

@@ -2,143 +2,32 @@ package encode
 
 import (
 	"fmt"
+	"mediacraft/config"
 	"mediacraft/decompress"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
-	"os/user"
-	"path"
 	"path/filepath"
 	"strings"
 	"time"
-
-	"gopkg.in/ini.v1"
 )
-
-// Variables globales de configuración y perfiles
-var (
-	profiles            map[string][]string
-	profileExts         map[string]string
-	defaultProfile      string
-	outputDir           string
-	enableNotifications bool
-	telegramToken       string
-	telegramChatID      string
-)
-
-// Carga perfiles y configuración desde el archivo INI
-func loadProfiles() error {
-	var confPath string
-	if os.PathSeparator == '\\' { // Windows
-		userProfile := os.Getenv("USERPROFILE")
-		confPath = path.Join(userProfile, ".config", "mediacraft", "mediacraft.conf")
-	} else { // Unix-like
-		usr, err := user.Current()
-		if err != nil {
-			return err
-		}
-		confPath = path.Join(usr.HomeDir, ".config", "mediacraft", "mediacraft.conf")
-	}
-	if _, err := os.Stat(confPath); err != nil {
-		return fmt.Errorf("no se encontró el archivo de configuración: %s", confPath)
-	}
-	cfg, err := ini.Load(confPath)
-	if err != nil {
-		return err
-	}
-	profiles = map[string][]string{}
-	profileExts = map[string]string{}
-	defaultProfile = "telegram"
-	outputDir = ""
-	enableNotifications = false
-	telegramToken = ""
-	telegramChatID = ""
-	// Leer configuración general
-	if sec, err := cfg.GetSection("mediacraft"); err == nil {
-		if sec.HasKey("default_profile") {
-			defaultProfile = sec.Key("default_profile").String()
-		}
-		if sec.HasKey("output_dir") {
-			outputDir = sec.Key("output_dir").String()
-		}
-		if sec.HasKey("notificaciones") {
-			v := sec.Key("notificaciones").String()
-			if v == "1" || v == "true" || v == "TRUE" || v == "True" {
-				enableNotifications = true
-			}
-		}
-	}
-	// Leer configuración de Telegram
-	if sec, err := cfg.GetSection("telegram"); err == nil {
-		if sec.HasKey("token") {
-			telegramToken = sec.Key("token").String()
-		}
-		if sec.HasKey("chat_id") {
-			telegramChatID = sec.Key("chat_id").String()
-		}
-	}
-	for _, section := range cfg.Sections() {
-		name := section.Name()
-		if len(name) > 9 && name[:9] == "perfiles." {
-			profileName := name[9:]
-			args := []string{}
-			var videoCodec, audioCodec, kvideo, kaudio string
-			for _, key := range section.KeyStrings() {
-				v := section.Key(key).String()
-				if v == "" {
-					continue
-				}
-				k := strings.ToLower(strings.TrimSpace(key))
-				switch k {
-				case "ext":
-					profileExts[profileName] = v
-				case "video":
-					videoCodec = strings.TrimSpace(v)
-				case "audio":
-					audioCodec = strings.TrimSpace(v)
-				case "kvideo":
-					kvideo = strings.TrimSpace(v)
-				case "kaudio":
-					kaudio = strings.TrimSpace(v)
-				default:
-					vNorm := strings.TrimSpace(strings.ReplaceAll(v, "=", ""))
-					args = append(args, "-"+k, vNorm)
-				}
-			}
-			if videoCodec != "" {
-				args = append(args, "-c:v", videoCodec)
-			}
-			if kvideo != "" {
-				args = append(args, "-b:v", kvideo)
-			}
-			if audioCodec != "" {
-				args = append(args, "-c:a", audioCodec)
-			}
-			if kaudio != "" {
-				args = append(args, "-b:a", kaudio)
-			}
-			profiles[profileName] = args
-		}
-	}
-	return nil
-}
 
 // Convert recibe el path y un perfil (por defecto: telegram)
 func Convert(path string) {
 	// Cargar perfiles desde el archivo INI
-	if err := loadProfiles(); err != nil {
+	if err := config.LoadProfiles(); err != nil {
 		fmt.Println("[ERROR] No se pudieron cargar los perfiles:", err)
 		return
 	}
 	// Determinar perfil y archivo real (soporta nombres con espacios)
-	profile := defaultProfile
+	profile := config.DefaultProfile
 	realPath := path
 	at := lastAt(path)
 	if at != -1 && at != 0 && at != len(path)-1 {
 		filePart := path[:at]
 		profilePart := trimSpaces(path[at+1:])
-		if _, ok := profiles[profilePart]; ok {
+		if _, ok := config.Profiles[profilePart]; ok {
 			profile = profilePart
 			realPath = filePart
 		}
@@ -149,16 +38,16 @@ func Convert(path string) {
 	if at := findSubstring(inputName, "@"); at != -1 {
 		inputName = inputName[:at]
 	}
-	finalPath, _ := decompress.JoinPartsIfNeeded(inputName)
-	_ = decompress.Decompress(finalPath)
-	if finalPath != "" {
-		inputName = finalPath
+	extracted, err := decompress.DecompressAuto(inputName)
+	if err == nil && len(extracted) > 0 && (len(extracted) != 1 || extracted[0] != inputName) {
+		fmt.Printf("\033[33m  Archivo comprimido detectado y extraído a temporal: %s\033[0m\n", extracted[0])
+		inputName = extracted[0]
 	}
 
 	// Determinar extensión de salida y formato ffmpeg (-f)
 	var outExt string
 	var ffFormat string
-	if ext, ok := profileExts[profile]; ok {
+	if ext, ok := config.ProfileExts[profile]; ok {
 		outExt = ext
 		if len(outExt) > 0 && outExt[0] != '.' {
 			outExt = "." + outExt
@@ -193,12 +82,12 @@ func Convert(path string) {
 	// Determinar ruta de salida
 	outName := getOutputNameWithExt(realPath, outExt)
 	out := outName
-	if outputDir != "" {
-		// Convertir outputDir a ruta absoluta si es relativa
-		absOutputDir := outputDir
-		if !filepath.IsAbs(outputDir) {
+	if config.OutputDir != "" {
+		// Convertir OutputDir a ruta absoluta si es relativa
+		absOutputDir := config.OutputDir
+		if !filepath.IsAbs(config.OutputDir) {
 			cwd, _ := os.Getwd()
-			absOutputDir = filepath.Join(cwd, outputDir)
+			absOutputDir = filepath.Join(cwd, config.OutputDir)
 		}
 		if _, err := os.Stat(absOutputDir); os.IsNotExist(err) {
 			err = os.MkdirAll(absOutputDir, 0755)
@@ -208,15 +97,19 @@ func Convert(path string) {
 		}
 		out = filepath.Join(absOutputDir, fileNameWithExt(outName))
 	}
-	fmt.Printf("Archivo de salida final: %s\n", out)
+	blue := "\033[34m"
+	green := "\033[32m"
+	yellow := "\033[33m"
+	reset := "\033[0m"
+	fmt.Printf("%sArchivo de salida final: %s%s\n", blue, out, reset)
 
 	// Mensajes previos profesionales (después de determinar perfil y extensión)
-	fmt.Printf("\n [SELECCIONADO] Perfil %s\n", capitalize(profile))
+	fmt.Printf("\n%s [SELECCIONADO] Perfil %s%s\n", yellow, capitalize(profile), reset)
 	if isNvidiaAvailable() {
-		fmt.Println(" GPU NVIDIA detectada - usando aceleración por hardware")
+		fmt.Printf("%s GPU NVIDIA detectada - usando aceleración por hardware%s\n", blue, reset)
 	}
-	fmt.Printf(" Iniciando conversión: %s\n", fileNameWithExt(inputName))
-	fmt.Printf(" Archivo de salida: %s\n", fileNameWithExt(out))
+	fmt.Printf("%s Iniciando conversión: %s%s\n", yellow, fileNameWithExt(inputName), reset)
+	fmt.Printf("%s Archivo de salida: %s%s\n", blue, fileNameWithExt(out), reset)
 
 	progressChan := make(chan string)
 	doneChan := make(chan struct{})
@@ -276,10 +169,10 @@ func Convert(path string) {
 		runFfmpegWithProgress(argsLog2, progressChan)
 	case "alta", "media", "baja":
 		argsLog1 = []string{"-y", "-hwaccel", "cuda", "-i", inputName}
-		argsLog1 = append(argsLog1, profiles[profile]...)
+		argsLog1 = append(argsLog1, config.Profiles[profile]...)
 		argsLog1 = append(argsLog1, "-pass", "1", "-an", "-f", "null", "NUL")
 		argsLog2 = []string{"-hwaccel", "cuda", "-i", inputName}
-		argsLog2 = append(argsLog2, profiles[profile]...)
+		argsLog2 = append(argsLog2, config.Profiles[profile]...)
 		argsLog2 = append(argsLog2, "-pass", "2")
 		if ffFormat != "" && out != "" {
 			argsLog2 = append(argsLog2, "-f", ffFormat)
@@ -289,8 +182,8 @@ func Convert(path string) {
 		runFfmpegWithProgress(argsLog2, progressChan)
 	case "movil", "youtube":
 		argsLog1 = []string{"-hwaccel", "cuda", "-i", inputName, "-c:v", "h264_nvenc"}
-		if len(profiles[profile]) > 2 {
-			argsLog1 = append(argsLog1, profiles[profile][2:]...)
+		if len(config.Profiles[profile]) > 2 {
+			argsLog1 = append(argsLog1, config.Profiles[profile][2:]...)
 		}
 		if ffFormat != "" && out != "" {
 			argsLog1 = append(argsLog1, "-f", ffFormat)
@@ -308,7 +201,7 @@ func Convert(path string) {
 		runFfmpegWithProgress(argsLog2, progressChan)
 	default:
 		argsLog1 = []string{"-i", inputName}
-		argsLog1 = append(argsLog1, profiles[profile]...)
+		argsLog1 = append(argsLog1, config.Profiles[profile]...)
 		if ffFormat != "" && out != "" {
 			argsLog1 = append(argsLog1, "-f", ffFormat)
 		}
@@ -325,10 +218,10 @@ func Convert(path string) {
 		durOut = 0
 	}
 	resumen := fmt.Sprintf("Resumen: %s → %s | Perfil: %s | Duración salida: %s | Progreso final: %s", fileNameWithExt(inputName), fileNameWithExt(out), profile, formatDuration(durOut), lastProgress)
-	fmt.Println(resumen)
+	fmt.Printf("%s%s%s\n", green, resumen, reset)
 	// Notificación Telegram si está habilitado
-	if enableNotifications && telegramToken != "" && telegramChatID != "" {
-		go sendTelegramNotification(telegramToken, telegramChatID, resumen)
+	if config.EnableNotifications && config.TelegramToken != "" && config.TelegramChatID != "" {
+		go sendTelegramNotification(config.TelegramToken, config.TelegramChatID, resumen)
 	}
 }
 
@@ -367,17 +260,6 @@ func getOutputNameWithExt(input string, ext string) string {
 		name = "output"
 	}
 	outputName := name + ext
-	// Si el nombre de salida coincide con el de entrada (ignorando ruta), agregar sufijo
-	inputBase := input
-	for i := len(inputBase) - 1; i >= 0; i-- {
-		if inputBase[i] == '/' || inputBase[i] == '\\' {
-			inputBase = inputBase[i+1:]
-			break
-		}
-	}
-	if strings.EqualFold(outputName, inputBase) {
-		outputName = name + "_out" + ext
-	}
 	return outputName
 }
 
@@ -503,7 +385,7 @@ func formatDuration(d float64) string {
 func getDuration(path string) float64 {
 	out, err := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path).Output()
 	if err != nil {
-		fmt.Println("No se pudo obtener la duración con ffprobe:", err)
+		fmt.Printf("\033[31m[ERROR] No se pudo obtener la duración con ffprobe: %v\033[0m\n", err)
 		return 0
 	}
 	var dur float64
